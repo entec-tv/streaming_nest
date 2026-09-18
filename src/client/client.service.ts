@@ -37,7 +37,16 @@ export class ClientService {
     return this.devicesService.register(macAddress, deviceKey);
   }
 
-  async auth(macAddress: string, deviceKey: string) {
+  async ping(macAddress: string, clientTime?: string) {
+    if (!macAddress) return { success: false };
+    const normalizedMac = macAddress.toUpperCase().replace(/[^A-F0-9]/g, '');
+    const timestamp = clientTime && !isNaN(new Date(clientTime).getTime()) ? new Date(clientTime) : new Date();
+    await this.customersService.updateLastActive(normalizedMac, timestamp);
+    await this.devicesService.updateLastActive(normalizedMac, timestamp);
+    return { success: true, timestamp };
+  }
+
+  async auth(macAddress: string, deviceKey: string, clientTime?: string) {
     // Normalize MAC address (uppercase, remove special chars)
     const normalizedMac = macAddress.toUpperCase().replace(/[^A-F0-9]/g, '');
     let customer = await this.customersService.findByMac(normalizedMac);
@@ -103,7 +112,9 @@ export class ClientService {
     }
 
     // Update last active timestamp for this device
-    await this.customersService.updateLastActive(normalizedMac);
+    const timestamp = clientTime && !isNaN(new Date(clientTime).getTime()) ? new Date(clientTime) : new Date();
+    await this.customersService.updateLastActive(normalizedMac, timestamp);
+    await this.devicesService.updateLastActive(normalizedMac, timestamp);
 
     const token = this.jwtService.sign({ 
       sub: (customer as any)._id?.toString(), 

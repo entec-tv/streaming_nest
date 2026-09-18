@@ -79,10 +79,15 @@ export class CustomersService {
     return { message: 'تم حذف العميل بنجاح' };
   }
 
-  async updateLastActive(macAddress: string): Promise<void> {
-    await this.customerModel.findOneAndUpdate(
-      { 'subscriptions.macAddress': macAddress },
-      { $set: { 'subscriptions.$.lastActive': new Date() } }
+  async updateLastActive(macAddress: string, timestamp: Date = new Date()): Promise<void> {
+    const cleanMac = macAddress.replace(/[^A-F0-9]/gi, '');
+    const regexPattern = cleanMac.split('').join('[:\\-]?');
+    const robustRegex = new RegExp(`^[^A-F0-9]*${regexPattern}[^A-F0-9]*$`, 'i');
+
+    await this.customerModel.updateMany(
+      { 'subscriptions.macAddress': { $regex: robustRegex } },
+      { $set: { 'subscriptions.$[elem].lastActive': timestamp } },
+      { arrayFilters: [{ 'elem.macAddress': { $regex: robustRegex } }] }
     );
   }
 

@@ -19,6 +19,17 @@ export class DevicesService {
     return this.deviceModel.findOne({ macAddress: { $in: [normalized, withColons] } }).exec();
   }
 
+  async updateLastActive(macAddress: string, timestamp: Date = new Date()): Promise<void> {
+    const cleanMac = macAddress.replace(/[^A-F0-9]/gi, '');
+    const regexPattern = cleanMac.split('').join('[:\\-]?');
+    const robustRegex = new RegExp(`^[^A-F0-9]*${regexPattern}[^A-F0-9]*$`, 'i');
+
+    await this.deviceModel.updateMany(
+      { macAddress: { $regex: robustRegex } },
+      { $set: { lastActive: timestamp } }
+    );
+  }
+
   async register(macAddress: string, deviceKey: string): Promise<Device> {
     const normalized = macAddress.toUpperCase().replace(/[^A-F0-9]/g, '');
     const withColons = normalized.match(/.{1,2}/g)?.join(':') || normalized;
