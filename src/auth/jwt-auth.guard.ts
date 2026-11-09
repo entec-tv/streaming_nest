@@ -1,15 +1,18 @@
 import { Injectable, CanActivate, ExecutionContext, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { requireJwtSecret } from './jwt-secret';
+import { AuthService } from './auth.service';
 
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
   constructor(
     private jwtService: JwtService,
     private configService: ConfigService,
+    private authService: AuthService,
   ) {}
 
-  canActivate(context: ExecutionContext): boolean {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest();
     const authorization = request.headers['authorization'];
 
@@ -20,9 +23,11 @@ export class JwtAuthGuard implements CanActivate {
     const token = authorization.split(' ')[1];
     try {
       const payload = this.jwtService.verify(token, {
-        secret: this.configService.get<string>('JWT_SECRET', 'super_secret_jwt_key'),
+        secret: requireJwtSecret(this.configService),
       });
-      request.user = payload;
+      const admin = await this.authService.getCurrentAdmin(String(payload.sub || ''));
+      if (!admin) throw new UnauthorizedException('الحساب الإداري غير موجود أو تم تعطيله');
+      request.user = { ...payload, ...admin };
       return true;
     } catch {
       throw new UnauthorizedException('الجلسة منتهية أو غير صالحة');

@@ -73,7 +73,7 @@ graph TD
 
 ### ⚙️ C. Backend API (`c:\streaming-nest`)
 - **Directory**: `c:\streaming-nest`
-- **Production Server**: `https://entecstreamingnestjs-production.up.railway.app/api`
+- **Production Server**: `https://streamingnest-production.up.railway.app/api`
 - **Database**: MongoDB Atlas (`entec-streaming` cluster)
 - **Key Capabilities**:
   1. **Client Endpoints (`/client`)**: Device registration, server-authoritative trial validation, device heartbeat, and SSE broadcast.

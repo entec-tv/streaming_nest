@@ -5,7 +5,7 @@ import { Host } from '../schemas/host.schema';
 import { JwtService } from '@nestjs/jwt';
 import { DevicesService } from '../devices/devices.service';
 import { HostsService } from '../hosts/hosts.service';
-import { Subject } from 'rxjs';
+import { Observable, Subject } from 'rxjs';
 
 @Injectable()
 export class ClientService {
@@ -16,20 +16,35 @@ export class ClientService {
     private readonly hostsService: HostsService,
   ) {}
 
-  private readonly deviceEvents = new Map<string, Subject<{ data: any }>>();
+  private readonly deviceEvents = new Map<string, { subject: Subject<{ data: any }>; listeners: number }>();
 
   getDeviceSse(macAddress: string) {
     const normalizedMac = macAddress.toUpperCase().replace(/[^A-F0-9]/g, '');
-    if (!this.deviceEvents.has(normalizedMac)) {
-      this.deviceEvents.set(normalizedMac, new Subject());
-    }
-    return this.deviceEvents.get(normalizedMac)!.asObservable();
+    return new Observable<{ data: any }>((subscriber) => {
+      let entry = this.deviceEvents.get(normalizedMac);
+      if (!entry) {
+        entry = { subject: new Subject<{ data: any }>(), listeners: 0 };
+        this.deviceEvents.set(normalizedMac, entry);
+      }
+
+      entry.listeners += 1;
+      const subscription = entry.subject.subscribe(subscriber);
+      return () => {
+        subscription.unsubscribe();
+        entry!.listeners = Math.max(0, entry!.listeners - 1);
+        if (entry!.listeners === 0 && this.deviceEvents.get(normalizedMac) === entry) {
+          entry!.subject.complete();
+          this.deviceEvents.delete(normalizedMac);
+        }
+      };
+    });
   }
 
   triggerDeviceRefresh(macAddress: string) {
     const normalizedMac = macAddress.toUpperCase().replace(/[^A-F0-9]/g, '');
-    if (this.deviceEvents.has(normalizedMac)) {
-      this.deviceEvents.get(normalizedMac)!.next({ data: { type: 'REFRESH' } });
+    const entry = this.deviceEvents.get(normalizedMac);
+    if (entry) {
+      entry.subject.next({ data: { type: 'REFRESH' } });
     }
   }
 
@@ -53,11 +68,25 @@ export class ClientService {
   async ping(macAddress: string, clientTime?: string) {
     if (!macAddress) return { success: false, serverTime: new Date().toISOString() };
     const normalizedMac = macAddress.toUpperCase().replace(/[^A-F0-9]/g, '');
+    if (!/^[A-F0-9]{12}$/.test(normalizedMac)) {
+      return { success: false, serverTime: new Date().toISOString(), isAppActive: false, isAppLocked: true };
+    }
     const serverNow = new Date();
     await this.customersService.updateLastActive(normalizedMac, serverNow);
     await this.devicesService.updateLastActive(normalizedMac, serverNow);
 
     const trialInfo = await this.devicesService.getTrialInfo(normalizedMac);
+    if (trialInfo.isRevoked) {
+      return {
+        success: true,
+        serverTime: serverNow.toISOString(),
+        trial: trialInfo,
+        hasActiveLicense: false,
+        appExpiry: null,
+        isAppActive: false,
+        isAppLocked: true,
+      };
+    }
     const customer = await this.customersService.findByMac(normalizedMac);
     let hasActiveLicense = false;
     let appExpiry: string | null = null;
@@ -97,8 +126,22 @@ export class ClientService {
       return { serverTime: new Date().toISOString(), isAppActive: false, isAppLocked: true };
     }
     const normalizedMac = macAddress.toUpperCase().replace(/[^A-F0-9]/g, '');
+    if (!/^[A-F0-9]{12}$/.test(normalizedMac)) {
+      return { serverTime: new Date().toISOString(), isAppActive: false, isAppLocked: true };
+    }
     const serverNow = new Date();
     const trialInfo = await this.devicesService.getTrialInfo(normalizedMac);
+    if (trialInfo.isRevoked) {
+      return {
+        serverTime: serverNow.toISOString(),
+        macAddress: normalizedMac,
+        trial: trialInfo,
+        hasActiveLicense: false,
+        appExpiry: null,
+        isAppActive: false,
+        isAppLocked: true,
+      };
+    }
     const customer = await this.customersService.findByMac(normalizedMac);
 
     let hasActiveLicense = false;

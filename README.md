@@ -31,6 +31,34 @@
 $ npm install
 ```
 
+## Required environment variables
+
+Copy `.env.example` to `.env` for local development and replace every placeholder.
+`JWT_SECRET` must be a random secret with at least 32 characters; the server will
+refuse to start without it. Set the same key in Railway before deploying.
+
+`ADMIN_SETUP_SECRET` is required only when creating the first admin through
+`POST /api/auth/setup`, sent in the `x-admin-setup-key` header. The setup route
+rejects requests after an admin account already exists.
+
+## Admin roles and audit history
+
+The dashboard supports three roles: `owner` manages admin accounts, `admin`
+can manage customers, devices, hosts, plans, and app updates, and `viewer` has
+read-only access with customer passwords and device keys removed from responses.
+On startup, the oldest existing admin becomes the owner if no owner exists;
+other admins receive the `admin` role. Keep at least one owner account.
+
+Authenticated admin write requests are recorded without request bodies or
+passwords. Owners and admins can review the paginated history at
+`GET /api/audit-logs`.
+
+Billing is a manual payment ledger, not a payment gateway or automatic license
+renewal. Owners and admins can list records and currency-separated totals at
+`GET /api/billing` and `GET /api/billing/summary`, create records with
+`POST /api/billing`, and update status with `PATCH /api/billing/:id/status`.
+Amounts are stored as integer minor units and accept at most two decimal places.
+
 ## Compile and run the project
 
 ```bash

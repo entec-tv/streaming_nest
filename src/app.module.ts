@@ -12,6 +12,10 @@ import { PlansModule } from './plans/plans.module';
 import { DevicesModule } from './devices/devices.module';
 import { PortalModule } from './portal/portal.module';
 import { AppUpdatesModule } from './app-updates/app-updates.module';
+import { APP_INTERCEPTOR } from '@nestjs/core';
+import { AuditModule } from './audit/audit.module';
+import { AdminAuditInterceptor } from './audit/admin-audit.interceptor';
+import { BillingModule } from './billing/billing.module';
 
 @Module({
   imports: [
@@ -24,12 +28,22 @@ import { AppUpdatesModule } from './app-updates/app-updates.module';
       }),
       inject: [ConfigService],
     }),
-    AuthModule, 
-    HostsModule, 
-    CustomersModule, 
-    ClientModule, PlansModule, DevicesModule, PortalModule, AppUpdatesModule
+    AuthModule,
+    HostsModule,
+    CustomersModule,
+    ClientModule,
+    PlansModule,
+    DevicesModule,
+    PortalModule,
+    AppUpdatesModule,
+    AuditModule,
+    BillingModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    AdminAuditInterceptor,
+    { provide: APP_INTERCEPTOR, useExisting: AdminAuditInterceptor },
+  ],
 })
 export class AppModule {}

@@ -37,6 +37,7 @@ export class CustomersService {
   async findByMac(macAddress: string): Promise<CustomerDocument | null> {
     // macAddress is passed normalized from client.service.ts
     const normalized = macAddress.toUpperCase().replace(/[^A-F0-9]/g, '');
+    if (!/^[A-F0-9]{12}$/.test(normalized)) return null;
     
     // Create a robust regex that ignores any non-hex characters between the hex digits
     // e.g. EB:EB... matches EB-EB... matches EBEB...
@@ -119,6 +120,7 @@ export class CustomersService {
 
   async updateLastActive(macAddress: string, timestamp: Date = new Date()): Promise<void> {
     const cleanMac = macAddress.replace(/[^A-F0-9]/gi, '');
+    if (!/^[A-F0-9]{12}$/i.test(cleanMac)) return;
     const regexPattern = cleanMac.split('').join('[:\\-]?');
     const robustRegex = new RegExp(`^[^A-F0-9]*${regexPattern}[^A-F0-9]*$`, 'i');
 

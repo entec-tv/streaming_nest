@@ -1,6 +1,9 @@
 import { Controller, Post, Body, Get, Query, Param, UseGuards } from '@nestjs/common';
 import { PortalService } from './portal.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { RolesGuard } from '../auth/roles.guard';
+import { Roles } from '../auth/roles.decorator';
+import { AdminRole } from '../schemas/admin.schema';
 
 @Controller('portal')
 export class PortalController {
@@ -19,7 +22,8 @@ export class PortalController {
     return this.portalService.getPlaylists(macAddress, deviceKey);
   }
 
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(AdminRole.ADMIN, AdminRole.OWNER)
   @Get('admin/playlists/:macAddress')
   getAdminPlaylists(@Param('macAddress') macAddress: string) {
     return this.portalService.getAdminPlaylists(macAddress);

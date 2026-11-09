@@ -1,5 +1,9 @@
-import { Controller, Post, Body, Sse, Query, Param } from '@nestjs/common';
+import { Controller, Post, Body, Sse, Query, Param, UseGuards } from '@nestjs/common';
 import { ClientService } from './client.service';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { RolesGuard } from '../auth/roles.guard';
+import { Roles } from '../auth/roles.decorator';
+import { AdminRole } from '../schemas/admin.schema';
 
 @Controller('client')
 export class ClientController {
@@ -31,6 +35,8 @@ export class ClientController {
   }
 
   @Post('devices/:macAddress/refresh')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(AdminRole.ADMIN, AdminRole.OWNER)
   triggerRefresh(@Param('macAddress') macAddress: string) {
     this.clientService.triggerDeviceRefresh(macAddress);
     return { success: true };

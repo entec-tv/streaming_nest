@@ -3,6 +3,11 @@ import mongoose, { Document } from 'mongoose';
 
 export type DeviceDocument = Device & Document;
 
+export enum DeviceStatus {
+  ACTIVE = 'active',
+  REVOKED = 'revoked',
+}
+
 @Schema({ _id: true })
 export class CustomPlaylist {
   @Prop({ required: true })
@@ -24,6 +29,15 @@ export class Device {
 
   @Prop({ required: true })
   deviceKey: string;
+
+  @Prop({ type: String, enum: DeviceStatus, default: DeviceStatus.ACTIVE, index: true })
+  status: DeviceStatus;
+
+  @Prop({ type: Date, default: null })
+  revokedAt?: Date | null;
+
+  @Prop({ type: String, default: null })
+  revokeReason?: string | null;
 
   @Prop({ type: [CustomPlaylistSchema], default: [] })
   customPlaylists: CustomPlaylist[];

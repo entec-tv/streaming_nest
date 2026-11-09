@@ -9,7 +9,7 @@ This workspace contains the production NestJS backend powering the entire EN-TEC
 - **Framework**: NestJS 11 (TypeScript)
 - **Database**: MongoDB Atlas (`entec-streaming` cluster) via Mongoose 9
 - **Hosting / CI/CD**: Railway Cloud
-- **Production Base URL**: `https://entecstreamingnestjs-production.up.railway.app/api`
+- **Production Base URL**: `https://streamingnest-production.up.railway.app/api`
 - **Deploy Trigger**: Pushing commits to `origin/main` automatically triggers a Railway production deployment.
 
 ```powershell
