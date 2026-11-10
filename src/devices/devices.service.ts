@@ -25,6 +25,44 @@ export class DevicesService {
     }));
   }
 
+  async searchByMacAddress(macAddress: string): Promise<any | null> {
+    const query = String(macAddress || '').trim();
+    if (!query) throw new BadRequestException('أدخل عنوان MAC للبحث');
+    if (query.length > 512) throw new BadRequestException('عنوان MAC أطول من الحد المسموح');
+
+    const macRegex = this.macAddressRegex(query);
+    const selection = 'macAddress status revokedAt revokeReason lastActive trialStartsAt trialEndsAt createdAt customPlaylists';
+    let device = await this.deviceModel
+      .findOne({ macAddress: query })
+      .select(selection)
+      .lean()
+      .exec();
+
+    if (!device && macRegex) {
+      device = await this.deviceModel
+        .findOne({ macAddress: { $regex: macRegex } })
+        .select(selection)
+        .lean()
+        .exec();
+    }
+
+    if (!device && !macRegex) {
+      device = await this.deviceModel
+        .findOne({ macAddress: query })
+        .collation({ locale: 'en', strength: 2 })
+        .select(selection)
+        .lean()
+        .exec();
+    }
+
+    if (!device) return null;
+    const { customPlaylists, ...result } = device as any;
+    return {
+      ...result,
+      playlistCount: Array.isArray(customPlaylists) ? customPlaylists.length : 0,
+    };
+  }
+
   async findByMac(macAddress: string): Promise<DeviceDocument | null> {
     const regex = this.macAddressRegex(macAddress);
     if (!regex) return null;
@@ -200,17 +238,24 @@ export class DevicesService {
   }
 
   async revoke(macAddress: string, suppliedDeviceKey?: string) {
-    const normalized = this.normalizeMacAddress(macAddress);
-    const regex = this.macAddressRegex(macAddress);
-    if (!regex) throw new BadRequestException('صيغة الماك أدرس غير صحيحة');
+    const lookup = String(macAddress || '').trim();
+    if (!lookup || lookup.length > 512) throw new BadRequestException('عنوان MAC غير صحيح');
+    const normalized = this.normalizeMacAddress(lookup);
+    const regex = this.macAddressRegex(lookup);
+    const deviceFilter = regex ? { macAddress: { $regex: regex } } : { macAddress: lookup };
+    const subscriptionFilter = regex
+      ? { 'subscriptions.macAddress': { $regex: regex } }
+      : { 'subscriptions.macAddress': lookup };
 
-    let device = await this.deviceModel.findOne({ macAddress: { $regex: regex } }).exec();
+    let device = await this.deviceModel.findOne(deviceFilter).exec();
     const customer = await this.customerModel
-      .findOne({ 'subscriptions.macAddress': { $regex: regex } })
+      .findOne(subscriptionFilter)
       .select('subscriptions.macAddress subscriptions.deviceKey')
       .exec();
     const matchingSubscription = customer?.subscriptions?.find(
-      (subscription: any) => this.normalizeMacAddress(subscription.macAddress) === normalized,
+      (subscription: any) => regex
+        ? this.normalizeMacAddress(subscription.macAddress) === normalized
+        : subscription.macAddress === lookup,
     ) as any;
     const deviceKey = device?.deviceKey || String(suppliedDeviceKey || '').trim() || matchingSubscription?.deviceKey;
 
@@ -221,7 +266,7 @@ export class DevicesService {
     if (!device) {
       const now = new Date();
       device = new this.deviceModel({
-        macAddress: this.formatMacAddress(normalized),
+        macAddress: regex ? this.formatMacAddress(normalized) : lookup,
         deviceKey,
         status: DeviceStatus.REVOKED,
         revokedAt: now,
@@ -237,8 +282,8 @@ export class DevicesService {
 
     await device.save();
     const cleanup = await this.customerModel.updateMany(
-      { 'subscriptions.macAddress': { $regex: regex } },
-      { $pull: { subscriptions: { macAddress: { $regex: regex } } } },
+      subscriptionFilter,
+      { $pull: { subscriptions: regex ? { macAddress: { $regex: regex } } : { macAddress: lookup } } },
     ).exec();
 
     return {
@@ -250,7 +295,12 @@ export class DevicesService {
   }
 
   async restore(macAddress: string) {
-    const device = await this.findByMac(macAddress);
+    const lookup = String(macAddress || '').trim();
+    if (!lookup || lookup.length > 512) throw new BadRequestException('عنوان MAC غير صحيح');
+    const regex = this.macAddressRegex(lookup);
+    const device = regex
+      ? await this.deviceModel.findOne({ macAddress: { $regex: regex } }).exec()
+      : await this.deviceModel.findOne({ macAddress: lookup }).collation({ locale: 'en', strength: 2 }).exec();
     if (!device) throw new NotFoundException('الجهاز غير موجود');
     device.status = DeviceStatus.ACTIVE;
     device.revokedAt = null;
