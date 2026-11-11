@@ -18,6 +18,26 @@ export class ClientService {
 
   private readonly deviceEvents = new Map<string, { subject: Subject<{ data: any }>; listeners: number }>();
 
+  private async getLicenseAccess(macAddress: string, serverNow: Date, deviceKey?: string) {
+    const customer = await this.customersService.findByMac(macAddress);
+    if (!customer || customer.status === CustomerStatus.BLOCKED) {
+      return { customer, subscriptions: [] as any[] };
+    }
+
+    const subscriptions = (customer.subscriptions || []).filter((subscription: any) => {
+      if ((subscription.macAddress || '').toUpperCase().replace(/[^A-F0-9]/g, '') !== macAddress) return false;
+      if (deviceKey !== undefined && subscription.deviceKey !== deviceKey) return false;
+      if (subscription.status === CustomerStatus.BLOCKED || subscription.appActive === false) return false;
+      if (subscription.appExpiry) {
+        const appExpiry = new Date(subscription.appExpiry).getTime();
+        if (!Number.isFinite(appExpiry) || appExpiry <= serverNow.getTime()) return false;
+      }
+      return true;
+    });
+
+    return { customer, subscriptions };
+  }
+
   getDeviceSse(macAddress: string) {
     const normalizedMac = macAddress.toUpperCase().replace(/[^A-F0-9]/g, '');
     return new Observable<{ data: any }>((subscriber) => {
@@ -49,19 +69,35 @@ export class ClientService {
   }
 
   async registerDevice(macAddress: string, deviceKey: string) {
-    const device = await this.devicesService.register(macAddress, deviceKey);
-    const trialInfo = await this.devicesService.getTrialInfo(macAddress);
     const serverNow = new Date();
+    const normalizedMac = String(macAddress || '').toUpperCase().replace(/[^A-F0-9]/g, '');
+    const isDeviceRevoked = await this.devicesService.isRevoked(normalizedMac);
+    const { customer, subscriptions } = await this.getLicenseAccess(normalizedMac, serverNow, deviceKey);
+
+    // A paid, active app license takes precedence over the trial/device revocation
+    // flag. Do not clear the administrative revocation; simply don't let it block
+    // a license that is valid for this exact MAC and device key.
+    if (isDeviceRevoked && subscriptions.length === 0) {
+      throw new ForbiddenException('تم إيقاف هذا الجهاز من الإدارة');
+    }
+
+    const device = isDeviceRevoked ? null : await this.devicesService.register(macAddress, deviceKey);
+    const trialInfo = await this.devicesService.getTrialInfo(macAddress);
+    const hasActiveLicense = subscriptions.length > 0;
+    const isTrialAccessAllowed = customer?.status !== CustomerStatus.BLOCKED && !trialInfo.isRevoked && trialInfo.isTrialActive;
+    const isAppActive = hasActiveLicense || isTrialAccessAllowed;
+
     return {
       success: true,
       device: {
-        macAddress: device.macAddress,
+        macAddress: device?.macAddress || normalizedMac,
       },
       serverTime: serverNow.toISOString(),
       trial: trialInfo,
       isTrialActive: trialInfo.isTrialActive,
-      isAppActive: trialInfo.isTrialActive,
-      isAppLocked: !trialInfo.isTrialActive,
+      hasActiveLicense,
+      isAppActive,
+      isAppLocked: !isAppActive,
     };
   }
 
@@ -76,39 +112,18 @@ export class ClientService {
     await this.devicesService.updateLastActive(normalizedMac, serverNow);
 
     const trialInfo = await this.devicesService.getTrialInfo(normalizedMac);
-    if (trialInfo.isRevoked) {
-      return {
-        success: true,
-        serverTime: serverNow.toISOString(),
-        trial: trialInfo,
-        hasActiveLicense: false,
-        appExpiry: null,
-        isAppActive: false,
-        isAppLocked: true,
-      };
-    }
-    const customer = await this.customersService.findByMac(normalizedMac);
-    let hasActiveLicense = false;
+    const { customer, subscriptions } = await this.getLicenseAccess(normalizedMac, serverNow);
+    const hasActiveLicense = subscriptions.length > 0;
     let appExpiry: string | null = null;
-    if (customer && customer.status !== CustomerStatus.BLOCKED && customer.subscriptions) {
-      const subs = customer.subscriptions.filter(
-        s => (s.macAddress || '').toUpperCase().replace(/[^A-F0-9]/g, '') === normalizedMac
-      );
-      for (const s of subs) {
-        if (s.status !== CustomerStatus.BLOCKED && s.appActive !== false) {
-          if (!s.appExpiry || new Date(s.appExpiry).getTime() > serverNow.getTime()) {
-            hasActiveLicense = true;
-            if (s.appExpiry) {
-              if (!appExpiry || new Date(s.appExpiry).getTime() > new Date(appExpiry).getTime()) {
-                appExpiry = new Date(s.appExpiry).toISOString();
-              }
-            }
-          }
-        }
+    for (const subscription of subscriptions) {
+      if (subscription.appExpiry) {
+        const expiry = new Date(subscription.appExpiry).toISOString();
+        if (!appExpiry || new Date(expiry).getTime() > new Date(appExpiry).getTime()) appExpiry = expiry;
       }
     }
 
-    const isAppActive = hasActiveLicense || trialInfo.isTrialActive;
+    const isTrialAccessAllowed = customer?.status !== CustomerStatus.BLOCKED && !trialInfo.isRevoked && trialInfo.isTrialActive;
+    const isAppActive = hasActiveLicense || isTrialAccessAllowed;
 
     return {
       success: true,
@@ -116,6 +131,7 @@ export class ClientService {
       trial: trialInfo,
       hasActiveLicense,
       appExpiry,
+      isRevoked: trialInfo.isRevoked,
       isAppActive,
       isAppLocked: !isAppActive,
     };
@@ -131,40 +147,18 @@ export class ClientService {
     }
     const serverNow = new Date();
     const trialInfo = await this.devicesService.getTrialInfo(normalizedMac);
-    if (trialInfo.isRevoked) {
-      return {
-        serverTime: serverNow.toISOString(),
-        macAddress: normalizedMac,
-        trial: trialInfo,
-        hasActiveLicense: false,
-        appExpiry: null,
-        isAppActive: false,
-        isAppLocked: true,
-      };
-    }
-    const customer = await this.customersService.findByMac(normalizedMac);
-
-    let hasActiveLicense = false;
+    const { customer, subscriptions } = await this.getLicenseAccess(normalizedMac, serverNow, deviceKey);
+    const hasActiveLicense = subscriptions.length > 0;
     let appExpiry: string | null = null;
-    if (customer && customer.status !== CustomerStatus.BLOCKED && customer.subscriptions) {
-      const subs = customer.subscriptions.filter(
-        s => (s.macAddress || '').toUpperCase().replace(/[^A-F0-9]/g, '') === normalizedMac
-      );
-      for (const s of subs) {
-        if ((!deviceKey || s.deviceKey === deviceKey) && s.status !== CustomerStatus.BLOCKED && s.appActive !== false) {
-          if (!s.appExpiry || new Date(s.appExpiry).getTime() > serverNow.getTime()) {
-            hasActiveLicense = true;
-            if (s.appExpiry) {
-              if (!appExpiry || new Date(s.appExpiry).getTime() > new Date(appExpiry).getTime()) {
-                appExpiry = new Date(s.appExpiry).toISOString();
-              }
-            }
-          }
-        }
+    for (const subscription of subscriptions) {
+      if (subscription.appExpiry) {
+        const expiry = new Date(subscription.appExpiry).toISOString();
+        if (!appExpiry || new Date(expiry).getTime() > new Date(appExpiry).getTime()) appExpiry = expiry;
       }
     }
 
-    const isAppActive = hasActiveLicense || trialInfo.isTrialActive;
+    const isTrialAccessAllowed = customer?.status !== CustomerStatus.BLOCKED && !trialInfo.isRevoked && trialInfo.isTrialActive;
+    const isAppActive = hasActiveLicense || isTrialAccessAllowed;
 
     return {
       serverTime: serverNow.toISOString(),
@@ -172,6 +166,7 @@ export class ClientService {
       trial: trialInfo,
       hasActiveLicense,
       appExpiry,
+      isRevoked: trialInfo.isRevoked,
       isAppActive,
       isAppLocked: !isAppActive,
     };
@@ -180,50 +175,41 @@ export class ClientService {
   async auth(macAddress: string, deviceKey: string, clientTime?: string) {
     const serverNow = new Date();
     // Normalize MAC address (uppercase, remove special chars)
-    const normalizedMac = macAddress.toUpperCase().replace(/[^A-F0-9]/g, '');
-    
-    // Ensure device exists
-    await this.devicesService.register(normalizedMac, deviceKey);
+    const normalizedMac = String(macAddress || '').toUpperCase().replace(/[^A-F0-9]/g, '');
+    if (!/^[A-F0-9]{12}$/.test(normalizedMac) || !deviceKey) {
+      throw new ForbiddenException('بيانات الجهاز غير صحيحة');
+    }
 
-    const trialInfo = await this.devicesService.getTrialInfo(normalizedMac);
-    const customer = await this.customersService.findByMac(normalizedMac);
-
+    const { customer, subscriptions: validSubs } = await this.getLicenseAccess(normalizedMac, serverNow, deviceKey);
     if (customer && customer.status === CustomerStatus.BLOCKED) {
       throw new ForbiddenException('حساب العميل محظور. يرجى التواصل مع الإدارة.');
     }
 
-    let hasActiveLicense = false;
+    const isDeviceRevoked = await this.devicesService.isRevoked(normalizedMac);
+    const hasActiveLicense = validSubs.length > 0;
+
+    // Trial-only access remains blocked for administratively revoked devices.
+    // A matching, active paid license is authoritative and permits app access.
+    if (isDeviceRevoked && !hasActiveLicense) {
+      throw new ForbiddenException('تم إيقاف هذا الجهاز من الإدارة');
+    }
+
+    if (!isDeviceRevoked) {
+      await this.devicesService.register(normalizedMac, deviceKey);
+    }
+
+    const trialInfo = await this.devicesService.getTrialInfo(normalizedMac);
     let latestAppExpiry: string | null = null;
-    let activeSubscriptions: any[] = [];
-
-    if (customer && customer.subscriptions) {
-      const subscriptionsForMac = customer.subscriptions.filter(
-        s => (s.macAddress || '').toUpperCase().replace(/[^A-F0-9]/g, '') === normalizedMac
-      );
-
-      // Return all active subscriptions that match this MAC address and Device Key
-      const validSubs = subscriptionsForMac.filter(s => {
-        if (s.deviceKey !== deviceKey) return false;
-        if (s.status === CustomerStatus.BLOCKED) return false;
-        
-        // Check app activation
-        if (s.appActive === false) return false;
-        if (s.appExpiry && new Date(s.appExpiry).getTime() < serverNow.getTime()) return false;
-        
-        return true;
-      });
-
-      if (validSubs.length > 0) {
-        hasActiveLicense = true;
-        for (const s of validSubs) {
-          if (s.appExpiry) {
-            if (!latestAppExpiry || new Date(s.appExpiry).getTime() > new Date(latestAppExpiry).getTime()) {
-              latestAppExpiry = new Date(s.appExpiry).toISOString();
-            }
-          }
+    for (const subscription of validSubs) {
+      if (subscription.appExpiry) {
+        const expiry = new Date(subscription.appExpiry).toISOString();
+        if (!latestAppExpiry || new Date(expiry).getTime() > new Date(latestAppExpiry).getTime()) {
+          latestAppExpiry = expiry;
         }
+      }
+    }
 
-        activeSubscriptions = await Promise.all(validSubs.map(async (s) => {
+    const activeSubscriptions = await Promise.all(validSubs.map(async (s) => {
           let hUrl = '';
           let hName = 'Admin Subscription';
 
@@ -255,10 +241,9 @@ export class ClientService {
             appExpiry: s.appExpiry,
           };
         }));
-      }
-    }
 
-    const isAppActive = hasActiveLicense || trialInfo.isTrialActive;
+    const isTrialAccessAllowed = !trialInfo.isRevoked && trialInfo.isTrialActive;
+    const isAppActive = hasActiveLicense || isTrialAccessAllowed;
 
     // Check if trial has expired and no active paid license
     if (!isAppActive) {
@@ -295,6 +280,7 @@ export class ClientService {
       appExpiry: latestAppExpiry,
       isAppActive: true,
       isAppLocked: false,
+      isRevoked: isDeviceRevoked,
     };
   }
 }
