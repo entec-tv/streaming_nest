@@ -16,7 +16,6 @@ interface PlaylistAccessCheck {
 }
 
 const PLAYLIST_ACCESS_CACHE_TTL_MS = 15 * 60 * 1000;
-const PLAYLIST_ACCESS_STALE_LIMIT_MS = 24 * 60 * 60 * 1000;
 const PLAYLIST_ACCESS_RETRY_MS = 5 * 60 * 1000;
 
 @Injectable()
@@ -135,7 +134,14 @@ export class ClientService {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const payload = await response.json() as any;
         const userInfo = payload?.user_info;
-        if (!userInfo || Number(userInfo.auth) === 0) {
+        if (!userInfo) {
+          return {
+            ...(cached || { isActive: true, expiresAt: null, checkedAt: nowMs }),
+            retryAfter: nowMs + PLAYLIST_ACCESS_RETRY_MS,
+            unavailable: true,
+          };
+        }
+        if (Number(userInfo.auth) === 0) {
           return { isActive: false, expiresAt: null, checkedAt: nowMs, retryAfter: nowMs + PLAYLIST_ACCESS_CACHE_TTL_MS };
         }
 
@@ -144,18 +150,10 @@ export class ClientService {
         const isActive = statusActive && !invalid && (!expiresAt || Date.parse(expiresAt) > nowMs);
         return { isActive, expiresAt, checkedAt: nowMs, retryAfter: nowMs + PLAYLIST_ACCESS_CACHE_TTL_MS };
       } catch {
-        const canUseRecentActiveCheck = cached?.isActive
-          && nowMs - cached.checkedAt <= PLAYLIST_ACCESS_STALE_LIMIT_MS
-          && (!cached.expiresAt || Date.parse(cached.expiresAt) > nowMs);
-        if (canUseRecentActiveCheck) {
-          return { ...cached, retryAfter: nowMs + PLAYLIST_ACCESS_RETRY_MS, unavailable: true };
-        }
         return {
-          // A provider outage does not prove that an account expired. Preserve
-          // a usable app session until the provider confirms expiry or revocation.
-          isActive: true,
-          expiresAt: cached?.expiresAt || null,
-          checkedAt: nowMs,
+          // Keep the last confirmed provider state during an outage. With no
+          // prior result, an outage alone is not proof that access expired.
+          ...(cached || { isActive: true, expiresAt: null, checkedAt: nowMs }),
           retryAfter: nowMs + PLAYLIST_ACCESS_RETRY_MS,
           unavailable: true,
         };
