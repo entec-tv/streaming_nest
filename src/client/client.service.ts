@@ -7,6 +7,18 @@ import { DevicesService } from '../devices/devices.service';
 import { HostsService } from '../hosts/hosts.service';
 import { Observable, Subject } from 'rxjs';
 
+interface PlaylistAccessCheck {
+  isActive: boolean;
+  expiresAt: string | null;
+  checkedAt: number;
+  retryAfter: number;
+  unavailable?: boolean;
+}
+
+const PLAYLIST_ACCESS_CACHE_TTL_MS = 15 * 60 * 1000;
+const PLAYLIST_ACCESS_STALE_LIMIT_MS = 24 * 60 * 60 * 1000;
+const PLAYLIST_ACCESS_RETRY_MS = 5 * 60 * 1000;
+
 @Injectable()
 export class ClientService {
   constructor(
@@ -17,8 +29,10 @@ export class ClientService {
   ) {}
 
   private readonly deviceEvents = new Map<string, { subject: Subject<{ data: any }>; listeners: number }>();
+  private readonly playlistAccessCache = new Map<string, PlaylistAccessCheck>();
+  private readonly playlistAccessRequests = new Map<string, Promise<PlaylistAccessCheck>>();
 
-  private async getLicenseAccess(macAddress: string, serverNow: Date, deviceKey?: string) {
+  private async getMatchingSubscriptions(macAddress: string, deviceKey?: string) {
     const customer = await this.customersService.findByMac(macAddress);
     if (!customer || customer.status === CustomerStatus.BLOCKED) {
       return { customer, subscriptions: [] as any[] };
@@ -27,15 +41,206 @@ export class ClientService {
     const subscriptions = (customer.subscriptions || []).filter((subscription: any) => {
       if ((subscription.macAddress || '').toUpperCase().replace(/[^A-F0-9]/g, '') !== macAddress) return false;
       if (deviceKey !== undefined && subscription.deviceKey !== deviceKey) return false;
-      if (subscription.status === CustomerStatus.BLOCKED || subscription.appActive === false) return false;
-      if (subscription.appExpiry) {
-        const appExpiry = new Date(subscription.appExpiry).getTime();
-        if (!Number.isFinite(appExpiry) || appExpiry <= serverNow.getTime()) return false;
-      }
       return true;
     });
 
     return { customer, subscriptions };
+  }
+
+  private async resolveSubscriptionHost(subscription: any): Promise<string> {
+    const host = subscription?.host;
+    if (typeof host === 'string' && /^[a-f\d]{24}$/i.test(host)) {
+      try {
+        return (await this.hostsService.findOne(host))?.url || '';
+      } catch {
+        return '';
+      }
+    }
+    if (host && typeof host === 'object') {
+      if ('url' in host) return String(host.url || '');
+      try {
+        return (await this.hostsService.findOne(host.toString()))?.url || '';
+      } catch {
+        return '';
+      }
+    }
+    return typeof host === 'string' ? host : '';
+  }
+
+  private parsePlaylistExpiry(rawExpiry: unknown): { expiresAt: string | null; invalid: boolean } {
+    const value = String(rawExpiry ?? '').trim();
+    if (!value || value.toLowerCase() === 'null' || value === '0') return { expiresAt: null, invalid: false };
+
+    const numeric = /^\d+$/.test(value) ? Number(value) : NaN;
+    const timestamp = Number.isFinite(numeric)
+      ? numeric * 1000
+      : Date.parse(value);
+    if (!Number.isFinite(timestamp)) return { expiresAt: null, invalid: true };
+    return { expiresAt: new Date(timestamp).toISOString(), invalid: false };
+  }
+
+  private effectivePlaylistCheck(check: PlaylistAccessCheck, nowMs: number): PlaylistAccessCheck {
+    if (check.expiresAt && Date.parse(check.expiresAt) <= nowMs) {
+      return { ...check, isActive: false, unavailable: false };
+    }
+    return check;
+  }
+
+  private cachePlaylistCheck(key: string, check: PlaylistAccessCheck) {
+    if (!this.playlistAccessCache.has(key) && this.playlistAccessCache.size >= 2000) {
+      const oldestKeys = Array.from(this.playlistAccessCache.keys()).slice(0, 400);
+      oldestKeys.forEach((oldestKey) => this.playlistAccessCache.delete(oldestKey));
+    }
+    this.playlistAccessCache.delete(key);
+    this.playlistAccessCache.set(key, check);
+  }
+
+  private async verifyPlaylistSubscription(subscription: any, macAddress: string, serverNow: Date): Promise<PlaylistAccessCheck> {
+    const identity = String(subscription?._id || `${subscription?.username || ''}:${subscription?.playlistName || ''}`);
+    const cacheKey = `${macAddress}:${identity}`;
+    const nowMs = serverNow.getTime();
+    const cached = this.playlistAccessCache.get(cacheKey);
+    if (cached && nowMs < cached.retryAfter) {
+      return this.effectivePlaylistCheck(cached, nowMs);
+    }
+
+    const running = this.playlistAccessRequests.get(cacheKey);
+    if (running) return this.effectivePlaylistCheck(await running, nowMs);
+
+    const request = (async (): Promise<PlaylistAccessCheck> => {
+      const host = (await this.resolveSubscriptionHost(subscription)).replace(/\/+$/, '');
+      const username = String(subscription?.username || '').trim();
+      const password = String(subscription?.password || '');
+      if (!/^https?:\/\//i.test(host) || !username || !password) {
+        return {
+          isActive: false,
+          expiresAt: cached?.expiresAt || null,
+          checkedAt: nowMs,
+          retryAfter: nowMs + PLAYLIST_ACCESS_RETRY_MS,
+          unavailable: true,
+        };
+      }
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 6000);
+
+      try {
+        const endpoint = new URL(`${host}/player_api.php`);
+        endpoint.searchParams.set('username', username);
+        endpoint.searchParams.set('password', password);
+        const response = await fetch(endpoint, {
+          headers: { Accept: 'application/json' },
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json() as any;
+        const userInfo = payload?.user_info;
+        if (!userInfo || Number(userInfo.auth) === 0) {
+          return { isActive: false, expiresAt: null, checkedAt: nowMs, retryAfter: nowMs + PLAYLIST_ACCESS_CACHE_TTL_MS };
+        }
+
+        const { expiresAt, invalid } = this.parsePlaylistExpiry(userInfo.exp_date);
+        const statusActive = String(userInfo.status || '').toLowerCase() === 'active';
+        const isActive = statusActive && !invalid && (!expiresAt || Date.parse(expiresAt) > nowMs);
+        return { isActive, expiresAt, checkedAt: nowMs, retryAfter: nowMs + PLAYLIST_ACCESS_CACHE_TTL_MS };
+      } catch {
+        const canUseRecentActiveCheck = cached?.isActive
+          && nowMs - cached.checkedAt <= PLAYLIST_ACCESS_STALE_LIMIT_MS
+          && (!cached.expiresAt || Date.parse(cached.expiresAt) > nowMs);
+        if (canUseRecentActiveCheck) {
+          return { ...cached, retryAfter: nowMs + PLAYLIST_ACCESS_RETRY_MS, unavailable: true };
+        }
+        return {
+          // A provider outage does not prove that an account expired. Preserve
+          // a usable app session until the provider confirms expiry or revocation.
+          isActive: true,
+          expiresAt: cached?.expiresAt || null,
+          checkedAt: nowMs,
+          retryAfter: nowMs + PLAYLIST_ACCESS_RETRY_MS,
+          unavailable: true,
+        };
+      } finally {
+        clearTimeout(timeout);
+      }
+    })();
+
+    this.playlistAccessRequests.set(cacheKey, request);
+    try {
+      const result = await request;
+      this.cachePlaylistCheck(cacheKey, result);
+      return this.effectivePlaylistCheck(result, nowMs);
+    } finally {
+      this.playlistAccessRequests.delete(cacheKey);
+    }
+  }
+
+  private async evaluateAccess(macAddress: string, serverNow: Date, deviceKey?: string) {
+    const [trial, match] = await Promise.all([
+      this.devicesService.getTrialInfo(macAddress),
+      this.getMatchingSubscriptions(macAddress, deviceKey),
+    ]);
+    const { customer, subscriptions: matchingSubscriptions } = match;
+    const customerBlocked = customer?.status === CustomerStatus.BLOCKED;
+    const administratorBlocked = Boolean(customerBlocked || trial.isRevoked);
+
+    if (administratorBlocked) {
+      return {
+        customer,
+        trial,
+        matchingSubscriptions,
+        activeSubscriptions: [] as any[],
+        hasActiveLicense: false,
+        appExpiry: null as string | null,
+        playlistExpiry: null as string | null,
+        isAppActive: false,
+        isAppLocked: true,
+        reason: customerBlocked ? 'admin_blocked' : 'device_blocked',
+      };
+    }
+
+    const appEnabledSubscriptions = matchingSubscriptions.filter((subscription: any) =>
+      subscription.status !== CustomerStatus.BLOCKED && subscription.appActive !== false,
+    );
+    const appActiveSubscriptions = appEnabledSubscriptions.filter((subscription: any) => {
+      if (!subscription.appExpiry) return true;
+      const expiresAt = new Date(subscription.appExpiry).getTime();
+      return Number.isFinite(expiresAt) && expiresAt > serverNow.getTime();
+    });
+    const playlistChecks = await Promise.all(appActiveSubscriptions.map((subscription: any) =>
+      this.verifyPlaylistSubscription(subscription, macAddress, serverNow),
+    ));
+    const activeSubscriptions = appActiveSubscriptions.filter((_, index) => playlistChecks[index].isActive);
+    const hasActiveLicense = activeSubscriptions.length > 0;
+    const trialAccessAllowed = matchingSubscriptions.length === 0 && trial.isTrialActive;
+    const isAppActive = hasActiveLicense || trialAccessAllowed;
+    const appExpiryValues = activeSubscriptions
+      .map((subscription: any) => subscription.appExpiry ? new Date(subscription.appExpiry).toISOString() : null)
+      .filter((value): value is string => Boolean(value));
+    const playlistExpiryValues = playlistChecks
+      .map((check) => check.expiresAt)
+      .filter((value): value is string => Boolean(value));
+
+    let reason: string | null = null;
+    if (!isAppActive) {
+      if (matchingSubscriptions.length === 0) reason = 'trial_expired';
+      else if (appEnabledSubscriptions.length === 0) reason = 'app_disabled';
+      else if (appActiveSubscriptions.length === 0) reason = 'app_subscription_expired';
+      else if (playlistChecks.some((check) => check.unavailable)) reason = 'playlist_unavailable';
+      else reason = 'playlist_subscription_expired';
+    }
+
+    return {
+      customer,
+      trial,
+      matchingSubscriptions,
+      activeSubscriptions,
+      hasActiveLicense,
+      appExpiry: appExpiryValues.length ? appExpiryValues.sort().at(-1)! : null,
+      playlistExpiry: playlistExpiryValues.length ? playlistExpiryValues.sort().at(-1)! : null,
+      isAppActive,
+      isAppLocked: !isAppActive,
+      reason,
+    };
   }
 
   getDeviceSse(macAddress: string) {
@@ -71,33 +276,19 @@ export class ClientService {
   async registerDevice(macAddress: string, deviceKey: string) {
     const serverNow = new Date();
     const normalizedMac = String(macAddress || '').toUpperCase().replace(/[^A-F0-9]/g, '');
-    const isDeviceRevoked = await this.devicesService.isRevoked(normalizedMac);
-    const { customer, subscriptions } = await this.getLicenseAccess(normalizedMac, serverNow, deviceKey);
-
-    // A paid, active app license takes precedence over the trial/device revocation
-    // flag. Do not clear the administrative revocation; simply don't let it block
-    // a license that is valid for this exact MAC and device key.
-    if (isDeviceRevoked && subscriptions.length === 0) {
-      throw new ForbiddenException('تم إيقاف هذا الجهاز من الإدارة');
-    }
-
-    const device = isDeviceRevoked ? null : await this.devicesService.register(macAddress, deviceKey);
-    const trialInfo = await this.devicesService.getTrialInfo(macAddress);
-    const hasActiveLicense = subscriptions.length > 0;
-    const isTrialAccessAllowed = customer?.status !== CustomerStatus.BLOCKED && !trialInfo.isRevoked && trialInfo.isTrialActive;
-    const isAppActive = hasActiveLicense || isTrialAccessAllowed;
+    const device = await this.devicesService.register(macAddress, deviceKey);
+    const access = await this.evaluateAccess(normalizedMac, serverNow, deviceKey);
 
     return {
       success: true,
-      device: {
-        macAddress: device?.macAddress || normalizedMac,
-      },
+      device: { macAddress: device.macAddress },
       serverTime: serverNow.toISOString(),
-      trial: trialInfo,
-      isTrialActive: trialInfo.isTrialActive,
-      hasActiveLicense,
-      isAppActive,
-      isAppLocked: !isAppActive,
+      trial: access.trial,
+      isTrialActive: access.trial.isTrialActive,
+      hasActiveLicense: access.hasActiveLicense,
+      isAppActive: access.isAppActive,
+      isAppLocked: access.isAppLocked,
+      reason: access.reason,
     };
   }
 
@@ -111,29 +302,20 @@ export class ClientService {
     await this.customersService.updateLastActive(normalizedMac, serverNow);
     await this.devicesService.updateLastActive(normalizedMac, serverNow);
 
-    const trialInfo = await this.devicesService.getTrialInfo(normalizedMac);
-    const { customer, subscriptions } = await this.getLicenseAccess(normalizedMac, serverNow);
-    const hasActiveLicense = subscriptions.length > 0;
-    let appExpiry: string | null = null;
-    for (const subscription of subscriptions) {
-      if (subscription.appExpiry) {
-        const expiry = new Date(subscription.appExpiry).toISOString();
-        if (!appExpiry || new Date(expiry).getTime() > new Date(appExpiry).getTime()) appExpiry = expiry;
-      }
-    }
-
-    const isTrialAccessAllowed = customer?.status !== CustomerStatus.BLOCKED && !trialInfo.isRevoked && trialInfo.isTrialActive;
-    const isAppActive = hasActiveLicense || isTrialAccessAllowed;
+    const device = await this.devicesService.findByMac(normalizedMac);
+    const access = await this.evaluateAccess(normalizedMac, serverNow, device?.deviceKey);
 
     return {
       success: true,
       serverTime: serverNow.toISOString(),
-      trial: trialInfo,
-      hasActiveLicense,
-      appExpiry,
-      isRevoked: trialInfo.isRevoked,
-      isAppActive,
-      isAppLocked: !isAppActive,
+      trial: access.trial,
+      hasActiveLicense: access.hasActiveLicense,
+      appExpiry: access.appExpiry,
+      playlistExpiry: access.playlistExpiry,
+      isRevoked: access.trial.isRevoked,
+      isAppActive: access.isAppActive,
+      isAppLocked: access.isAppLocked,
+      reason: access.reason,
     };
   }
 
@@ -146,29 +328,20 @@ export class ClientService {
       return { serverTime: new Date().toISOString(), isAppActive: false, isAppLocked: true };
     }
     const serverNow = new Date();
-    const trialInfo = await this.devicesService.getTrialInfo(normalizedMac);
-    const { customer, subscriptions } = await this.getLicenseAccess(normalizedMac, serverNow, deviceKey);
-    const hasActiveLicense = subscriptions.length > 0;
-    let appExpiry: string | null = null;
-    for (const subscription of subscriptions) {
-      if (subscription.appExpiry) {
-        const expiry = new Date(subscription.appExpiry).toISOString();
-        if (!appExpiry || new Date(expiry).getTime() > new Date(appExpiry).getTime()) appExpiry = expiry;
-      }
-    }
-
-    const isTrialAccessAllowed = customer?.status !== CustomerStatus.BLOCKED && !trialInfo.isRevoked && trialInfo.isTrialActive;
-    const isAppActive = hasActiveLicense || isTrialAccessAllowed;
+    const device = deviceKey ? null : await this.devicesService.findByMac(normalizedMac);
+    const access = await this.evaluateAccess(normalizedMac, serverNow, deviceKey || device?.deviceKey);
 
     return {
       serverTime: serverNow.toISOString(),
       macAddress: normalizedMac,
-      trial: trialInfo,
-      hasActiveLicense,
-      appExpiry,
-      isRevoked: trialInfo.isRevoked,
-      isAppActive,
-      isAppLocked: !isAppActive,
+      trial: access.trial,
+      hasActiveLicense: access.hasActiveLicense,
+      appExpiry: access.appExpiry,
+      playlistExpiry: access.playlistExpiry,
+      isRevoked: access.trial.isRevoked,
+      isAppActive: access.isAppActive,
+      isAppLocked: access.isAppLocked,
+      reason: access.reason,
     };
   }
 
@@ -180,36 +353,32 @@ export class ClientService {
       throw new ForbiddenException('بيانات الجهاز غير صحيحة');
     }
 
-    const { customer, subscriptions: validSubs } = await this.getLicenseAccess(normalizedMac, serverNow, deviceKey);
-    if (customer && customer.status === CustomerStatus.BLOCKED) {
-      throw new ForbiddenException('حساب العميل محظور. يرجى التواصل مع الإدارة.');
+    await this.devicesService.register(normalizedMac, deviceKey);
+    const access = await this.evaluateAccess(normalizedMac, serverNow, deviceKey);
+
+    if (!access.isAppActive) {
+      const error = access.reason || 'subscription_expired';
+      const messages: Record<string, string> = {
+        admin_blocked: 'تم إيقاف التطبيق من الإدارة. يرجى التواصل مع الإدارة.',
+        device_blocked: 'تم إيقاف هذا الجهاز من الإدارة.',
+        app_disabled: 'تفعيل التطبيق معطّل من الإدارة.',
+        app_subscription_expired: 'انتهت صلاحية اشتراك التطبيق.',
+        playlist_subscription_expired: 'انتهت صلاحية اشتراك قائمة التشغيل.',
+        playlist_unavailable: 'تعذّر التحقق من صلاحية قائمة التشغيل الآن.',
+        trial_expired: 'انتهت الفترة التجريبية للتطبيق.',
+      };
+      throw new ForbiddenException({
+        error,
+        message: messages[error] || messages.trial_expired,
+        serverTime: serverNow.toISOString(),
+        trial: access.trial,
+        hasActiveLicense: access.hasActiveLicense,
+        isAppActive: false,
+        isAppLocked: true,
+      });
     }
 
-    const isDeviceRevoked = await this.devicesService.isRevoked(normalizedMac);
-    const hasActiveLicense = validSubs.length > 0;
-
-    // Trial-only access remains blocked for administratively revoked devices.
-    // A matching, active paid license is authoritative and permits app access.
-    if (isDeviceRevoked && !hasActiveLicense) {
-      throw new ForbiddenException('تم إيقاف هذا الجهاز من الإدارة');
-    }
-
-    if (!isDeviceRevoked) {
-      await this.devicesService.register(normalizedMac, deviceKey);
-    }
-
-    const trialInfo = await this.devicesService.getTrialInfo(normalizedMac);
-    let latestAppExpiry: string | null = null;
-    for (const subscription of validSubs) {
-      if (subscription.appExpiry) {
-        const expiry = new Date(subscription.appExpiry).toISOString();
-        if (!latestAppExpiry || new Date(expiry).getTime() > new Date(latestAppExpiry).getTime()) {
-          latestAppExpiry = expiry;
-        }
-      }
-    }
-
-    const activeSubscriptions = await Promise.all(validSubs.map(async (s) => {
+    const activeSubscriptions = await Promise.all(access.activeSubscriptions.map(async (s) => {
           let hUrl = '';
           let hName = 'Admin Subscription';
 
@@ -242,21 +411,7 @@ export class ClientService {
           };
         }));
 
-    const isTrialAccessAllowed = !trialInfo.isRevoked && trialInfo.isTrialActive;
-    const isAppActive = hasActiveLicense || isTrialAccessAllowed;
-
-    // Check if trial has expired and no active paid license
-    if (!isAppActive) {
-      throw new ForbiddenException({
-        error: 'trial_expired',
-        message: 'انتهت الفترة التجريبية للتطبيق (7 أيام). يرجى شراء ترخيص للاستمرار في استخدام التطبيق.',
-        serverTime: serverNow.toISOString(),
-        trial: trialInfo,
-        hasActiveLicense: false,
-        isAppActive: false,
-        isAppLocked: true,
-      });
-    }
+    const customer = access.customer;
 
     // Update last active timestamp for this device using server clock
     await this.customersService.updateLastActive(normalizedMac, serverNow);
@@ -275,12 +430,13 @@ export class ClientService {
         subscriptions: activeSubscriptions,
       },
       serverTime: serverNow.toISOString(),
-      trial: trialInfo,
-      hasActiveLicense,
-      appExpiry: latestAppExpiry,
+      trial: access.trial,
+      hasActiveLicense: access.hasActiveLicense,
+      appExpiry: access.appExpiry,
+      playlistExpiry: access.playlistExpiry,
       isAppActive: true,
       isAppLocked: false,
-      isRevoked: isDeviceRevoked,
+      isRevoked: access.trial.isRevoked,
     };
   }
 }
