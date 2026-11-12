@@ -31,6 +31,22 @@ export class DevicesService {
     return this.deviceModel.findOne({ macAddress: { $regex: regex } }).exec();
   }
 
+  async searchByMac(macAddress: string): Promise<any | null> {
+    const regex = this.macAddressRegex(macAddress);
+    if (!regex) return null;
+    const device = await this.deviceModel
+      .findOne({ macAddress: { $regex: regex } })
+      .select('macAddress deviceKey status revokedAt revokeReason lastActive trialStartsAt trialEndsAt createdAt customPlaylists')
+      .lean()
+      .exec();
+    if (!device) return null;
+    const { customPlaylists = [], ...safeDevice } = device as any;
+    return {
+      ...safeDevice,
+      playlistCount: Array.isArray(customPlaylists) ? customPlaylists.length : 0,
+    };
+  }
+
   private normalizeMacAddress(macAddress: string): string {
     return String(macAddress || '').toUpperCase().replace(/[^A-F0-9]/g, '');
   }

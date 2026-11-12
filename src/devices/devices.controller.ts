@@ -1,4 +1,4 @@
-import { Controller, Get, Body, Param, Put, Delete, UseGuards } from '@nestjs/common';
+import { Controller, Get, Body, Param, Put, Delete, UseGuards, Query } from '@nestjs/common';
 import { DevicesService } from './devices.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
@@ -13,6 +13,11 @@ export class DevicesController {
   @Get()
   findAll() {
     return this.devicesService.findAll();
+  }
+
+  @Get('search')
+  search(@Query('macAddress') macAddress: string) {
+    return this.devicesService.searchByMac(macAddress);
   }
 
   @Put(':macAddress/identity')
